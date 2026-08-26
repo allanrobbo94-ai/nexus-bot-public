@@ -364,6 +364,69 @@ function runBacktest(candles,strategy){
   return results;
 }
 
+// Walk-Forward: split history into sequential windows, test the SAME strategy
+// settings on each independently. Consistent positive results across windows
+// = robust strategy. Only working in one window = likely curve-fit/lucky.
+function runWalkForwardTest(candles,strategy,windows=4){
+  if(!candles||candles.length<200)return null;
+  const windowSize=Math.floor(candles.length/windows);
+  const results=[];
+  for(let w=0;w<windows;w++){
+    const start=w*windowSize;
+    const end=w===windows-1?candles.length:(w+1)*windowSize;
+    const segment=candles.slice(start,end);
+    if(segment.length<50)continue;
+    const r=runBacktest(segment,strategy);
+    if(r)results.push({window:w+1,...r});
+  }
+  if(results.length===0)return null;
+  const returns=results.map(r=>r.return);
+  const avgReturn=returns.reduce((a,b)=>a+b,0)/returns.length;
+  const positiveWindows=results.filter(r=>r.return>0).length;
+  const consistency=Math.round((positiveWindows/results.length)*100);
+  const stdReturn=Math.sqrt(returns.reduce((a,b)=>a+(b-avgReturn)**2,0)/(returns.length||1));
+  return{windows:results,avgReturn:Math.round(avgReturn*10)/10,consistency,positiveWindows,totalWindows:results.length,stdReturn:Math.round(stdReturn*10)/10};
+}
+
+// Monte Carlo: reshuffle the actual trade P&L sequence thousands of times to
+// reveal the realistic range of outcomes (median/5th/95th percentile) and
+// worst-case drawdown risk — a single backtest run hides this sequence risk.
+function runMonteCarloSimulation(trades,startBalance=1000,runs=1000){
+  if(!trades||trades.length<5)return null;
+  const pnls=trades.map(t=>t.pnl);
+  const finalBalances=[];
+  const maxDrawdowns=[];
+  for(let i=0;i<runs;i++){
+    const shuffled=[...pnls];
+    for(let j=shuffled.length-1;j>0;j--){
+      const k=Math.floor(Math.random()*(j+1));
+      const tmp=shuffled[j];shuffled[j]=shuffled[k];shuffled[k]=tmp;
+    }
+    let balance=startBalance,peak=startBalance,maxDD=0;
+    shuffled.forEach(pnl=>{
+      balance+=pnl;
+      if(balance>peak)peak=balance;
+      const dd=(peak-balance)/peak*100;
+      if(dd>maxDD)maxDD=dd;
+    });
+    finalBalances.push(balance);
+    maxDrawdowns.push(maxDD);
+  }
+  finalBalances.sort((a,b)=>a-b);
+  maxDrawdowns.sort((a,b)=>a-b);
+  const pct=(arr,p)=>arr[Math.min(arr.length-1,Math.floor(arr.length*p))];
+  const ruinCount=finalBalances.filter(b=>b<startBalance*0.5).length;
+  return{
+    median:Math.round(pct(finalBalances,0.5)*100)/100,
+    p5:Math.round(pct(finalBalances,0.05)*100)/100,
+    p95:Math.round(pct(finalBalances,0.95)*100)/100,
+    worstDD:Math.round(pct(maxDrawdowns,0.95)*10)/10,
+    medianDD:Math.round(pct(maxDrawdowns,0.5)*10)/10,
+    probRuin:Math.round((ruinCount/runs)*100),
+    runs
+  };
+}
+
 const NEWS=[
   {headline:"Federal Reserve signals rate pause — crypto markets rally",sentiment:"bullish",time:"2m ago",impact:"HIGH",score:85},
   {headline:"Bitcoin ETF sees record $480M inflow in single session",sentiment:"bullish",time:"8m ago",impact:"HIGH",score:92},
@@ -776,7 +839,7 @@ function CandleChart({candles,signal,timeframe,onTimeframeChange,openOrders,pair
   );
 }
 // ── Order Modal ────────────────────────────────────────────────────
-function OrderModal({pair,signal,price,isDemo,balance,onClose,onPlace}){
+function OrderModal({pair,signal,price,isDemo,balance,strategy,onClose,onPlace}){
   const [mode,setMode]=useState("spot");
   const [side,setSide]=useState(signal?.direction.includes("BUY")?"BUY":"SELL");
   const [orderType,setOrderType]=useState("LIMIT");
@@ -820,6 +883,14 @@ function OrderModal({pair,signal,price,isDemo,balance,onClose,onPlace}){
           <button onClick={onClose} style={{background:C.bg3,border:"1px solid "+C.border,color:C.white,width:34,height:34,borderRadius:8,cursor:"pointer",fontSize:18,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>✕</button>
         </div>
         <div style={{padding:18}}>
+          {strategy&&(strategy.walkForwardConsistency!==undefined&&strategy.walkForwardConsistency<50)&&<div style={{background:C.redDim,border:"1px solid "+C.red+"44",borderRadius:6,padding:"10px 12px",marginBottom:14}}>
+            <div style={{color:C.red,fontSize:10,fontWeight:700,marginBottom:2}}>⚠ LOW ROBUSTNESS SCORE</div>
+            <div style={{color:C.slate,fontSize:9,lineHeight:1.5}}>This strategy was only profitable in {strategy.walkForwardConsistency}% of tested historical periods — it may be overfit rather than genuinely reliable. Consider a smaller size or re-testing before entering.</div>
+          </div>}
+          {strategy&&(strategy.monteCarloProbRuin!==undefined&&strategy.monteCarloProbRuin>10)&&<div style={{background:C.redDim,border:"1px solid "+C.red+"44",borderRadius:6,padding:"10px 12px",marginBottom:14}}>
+            <div style={{color:C.red,fontSize:10,fontWeight:700,marginBottom:2}}>⚠ ELEVATED RUIN RISK</div>
+            <div style={{color:C.slate,fontSize:9,lineHeight:1.5}}>Monte Carlo simulation shows a {strategy.monteCarloProbRuin}% chance of losing over half your account with this strategy's trade sequence risk. Size accordingly.</div>
+          </div>}
           <div style={{display:"flex",gap:4,marginBottom:14,background:C.bg2,padding:4,borderRadius:8}}>
             {[["spot","SPOT"],["futures","FUTURES"],["options","OPTIONS"]].map(([m,l])=>(<button key={m} onClick={()=>setMode(m)} style={{flex:1,padding:"8px 0",borderRadius:6,border:"none",cursor:"pointer",background:mode===m?C.bg4:"none",color:mode===m?C.white:C.slate,fontFamily:"monospace",fontSize:11,fontWeight:mode===m?700:400}}>{l}</button>))}
           </div>
@@ -1008,9 +1079,14 @@ function AIAnalysisPanel({pair,signal,price,timeframe,isDemo,apiKey}){
   );
 }
 
-function BacktestPanel({candles,strategy,pair}){
+function BacktestPanel({candles,strategy,pair,setStrategy}){
   const [running,setRunning]=useState(false);
   const [results,setResults]=useState(null);
+  const [wfRunning,setWfRunning]=useState(false);
+  const [wfResults,setWfResults]=useState(null);
+  const [mcRunning,setMcRunning]=useState(false);
+  const [mcResults,setMcResults]=useState(null);
+  const [appliedMsg,setAppliedMsg]=useState(false);
   const [period,setPeriod]=useState("all");
   function run(){
     setRunning(true);
@@ -1055,6 +1131,63 @@ function BacktestPanel({candles,strategy,pair}){
         </div>}
       </>}
       {!results&&!running&&<div style={{color:C.dimText,fontSize:11,textAlign:"center",padding:20}}>Click RUN BACKTEST to test your strategy on {candles.length} candles</div>}
+
+      <div style={{marginTop:16,paddingTop:16,borderTop:"1px solid "+C.border}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+          <span style={{color:C.blue,fontSize:11,fontFamily:"monospace",fontWeight:700}}>◈ WALK-FORWARD TEST</span>
+          <button onClick={()=>{
+            setWfRunning(true);
+            setTimeout(()=>{setWfResults(runWalkForwardTest(candles,strategy,4));setWfRunning(false);},500);
+          }} disabled={wfRunning} style={{background:wfRunning?C.bg3:C.bg2,border:"1px solid "+(wfRunning?C.border:C.blue),color:wfRunning?C.slate:C.blue,padding:"5px 14px",borderRadius:4,fontFamily:"monospace",fontSize:10,cursor:wfRunning?"not-allowed":"pointer",fontWeight:700}}>{wfRunning?"RUNNING...":"RUN WALK-FORWARD"}</button>
+        </div>
+        <div style={{color:C.dimText,fontSize:9,marginBottom:10}}>Splits your history into 4 sequential periods and tests these exact settings on each independently. Consistent profit across periods = robust. Only working in one period = likely curve-fit.</div>
+        {wfResults&&<>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:8,marginBottom:10}}>
+            <div style={{background:C.bg3,borderRadius:5,padding:"8px 10px"}}><div style={{color:C.dimText,fontSize:8}}>Consistency</div><div style={{color:wfResults.consistency>=75?C.green:wfResults.consistency>=50?C.gold:C.red,fontSize:16,fontWeight:700}}>{wfResults.consistency}%</div><div style={{color:C.dimText,fontSize:8}}>{wfResults.positiveWindows}/{wfResults.totalWindows} periods profitable</div></div>
+            <div style={{background:C.bg3,borderRadius:5,padding:"8px 10px"}}><div style={{color:C.dimText,fontSize:8}}>Avg Return / Period</div><div style={{color:wfResults.avgReturn>=0?C.green:C.red,fontSize:16,fontWeight:700}}>{wfResults.avgReturn>=0?"+":""}{wfResults.avgReturn}%</div><div style={{color:C.dimText,fontSize:8}}>σ {wfResults.stdReturn}%</div></div>
+          </div>
+          <div style={{display:"flex",flexDirection:"column",gap:4,marginBottom:10}}>
+            {wfResults.windows.map(w=>(
+              <div key={w.window} style={{display:"flex",justifyContent:"space-between",padding:"5px 8px",background:C.bg3,borderRadius:4}}>
+                <span style={{color:C.slate,fontSize:9}}>Period {w.window}</span>
+                <span style={{color:C.slate,fontSize:9}}>{w.totalTrades} trades, {w.winRate}% WR</span>
+                <span style={{color:w.return>=0?C.green:C.red,fontSize:9,fontWeight:700}}>{w.return>=0?"+":""}{w.return}%</span>
+              </div>
+            ))}
+          </div>
+          {wfResults.consistency<50&&<div style={{background:C.redDim,border:"1px solid "+C.red+"44",borderRadius:5,padding:"8px 10px",marginBottom:10}}><div style={{color:C.red,fontSize:9}}>⚠ Only profitable in {wfResults.consistency}% of tested periods — this strategy may be overfit to a specific market condition rather than genuinely robust.</div></div>}
+        </>}
+      </div>
+
+      <div style={{marginTop:16,paddingTop:16,borderTop:"1px solid "+C.border}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+          <span style={{color:C.purple,fontSize:11,fontFamily:"monospace",fontWeight:700}}>◈ MONTE CARLO SIMULATION</span>
+          <button onClick={()=>{
+            if(!results||!results.trades||results.trades.length<5)return;
+            setMcRunning(true);
+            setTimeout(()=>{setMcResults(runMonteCarloSimulation(results.trades,1000,1000));setMcRunning(false);},500);
+          }} disabled={mcRunning||!results||results.trades.length<5} style={{background:mcRunning?C.bg3:C.bg2,border:"1px solid "+(mcRunning?C.border:C.purple),color:mcRunning?C.slate:C.purple,padding:"5px 14px",borderRadius:4,fontFamily:"monospace",fontSize:10,cursor:(mcRunning||!results||results.trades.length<5)?"not-allowed":"pointer",fontWeight:700,opacity:(!results||results.trades.length<5)?0.4:1}}>{mcRunning?"RUNNING...":"RUN MONTE CARLO"}</button>
+        </div>
+        <div style={{color:C.dimText,fontSize:9,marginBottom:10}}>Reshuffles your backtest's actual trade sequence 1,000 times to reveal the realistic range of outcomes — a single backtest hides how much luck/order affected the result. Requires a completed backtest above with 5+ trades.</div>
+        {mcResults&&<>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:6,marginBottom:10}}>
+            <div style={{background:C.bg3,borderRadius:5,padding:"8px 10px",textAlign:"center"}}><div style={{color:C.dimText,fontSize:8}}>Worst 5%</div><div style={{color:C.red,fontSize:13,fontWeight:700}}>${fmt(mcResults.p5,0)}</div></div>
+            <div style={{background:C.bg3,borderRadius:5,padding:"8px 10px",textAlign:"center"}}><div style={{color:C.dimText,fontSize:8}}>Median</div><div style={{color:C.white,fontSize:13,fontWeight:700}}>${fmt(mcResults.median,0)}</div></div>
+            <div style={{background:C.bg3,borderRadius:5,padding:"8px 10px",textAlign:"center"}}><div style={{color:C.dimText,fontSize:8}}>Best 5%</div><div style={{color:C.green,fontSize:13,fontWeight:700}}>${fmt(mcResults.p95,0)}</div></div>
+          </div>
+          <div style={{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:"1px solid "+C.border+"22"}}><span style={{color:C.slate,fontSize:10}}>Median Max Drawdown</span><span style={{color:C.gold,fontSize:11,fontWeight:700}}>{mcResults.medianDD}%</span></div>
+          <div style={{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:"1px solid "+C.border+"22"}}><span style={{color:C.slate,fontSize:10}}>Worst-Case (95th %ile) Drawdown</span><span style={{color:C.red,fontSize:11,fontWeight:700}}>{mcResults.worstDD}%</span></div>
+          <div style={{display:"flex",justifyContent:"space-between",padding:"6px 0",marginBottom:10}}><span style={{color:C.slate,fontSize:10}}>Probability of Ruin (balance {"<"}50%)</span><span style={{color:mcResults.probRuin>10?C.red:mcResults.probRuin>2?C.gold:C.green,fontSize:11,fontWeight:700}}>{mcResults.probRuin}%</span></div>
+        </>}
+      </div>
+
+      {(wfResults||mcResults)&&setStrategy&&<div style={{marginTop:16,paddingTop:16,borderTop:"1px solid "+C.border}}>
+        <button onClick={()=>{
+          setStrategy(s=>({...s,walkForwardConsistency:wfResults?wfResults.consistency:s.walkForwardConsistency,monteCarloProbRuin:mcResults?mcResults.probRuin:s.monteCarloProbRuin}));
+          setAppliedMsg(true);setTimeout(()=>setAppliedMsg(false),2500);
+        }} style={{width:"100%",padding:"10px 0",borderRadius:5,border:"1px solid "+C.gold,background:appliedMsg?C.greenDim:C.goldDim,color:appliedMsg?C.green:C.gold,cursor:"pointer",fontFamily:"monospace",fontSize:11,fontWeight:700}}>{appliedMsg?"✓ APPLIED — AUTO-TRADING WILL NOW USE THESE RESULTS":"APPLY TO AUTO-TRADING"}</button>
+        <div style={{color:C.dimText,fontSize:8,marginTop:6,textAlign:"center"}}>Saves these robustness scores to your strategy. Auto-trading will automatically reduce position size (or pause) when consistency is low or ruin risk is high.</div>
+      </div>}
     </div>
   );
 }
@@ -1273,7 +1406,6 @@ function AutoTradeEngine({isDemo,autoMode,signals,prices,strategy,openOrders,can
   const trailHighWater=useRef({});
 
   useEffect(()=>{
-    if(!isDemo||autoMode==="OFF")return;
     const iv=setInterval(()=>{
       const today=new Date().toDateString();
       if(today!==lastDay.current){dailyCount.current=0;lastDay.current=today;}
@@ -1284,9 +1416,10 @@ function AutoTradeEngine({isDemo,autoMode,signals,prices,strategy,openOrders,can
       const currentPrices=pricesRef.current;
       const currentBalance=balanceRef.current;
 
-      // Monitor open positions
+      // Monitor open positions — runs for ALL open orders (demo AND live),
+      // regardless of Auto Mode setting, so trailing stops/breakeven/TP/SL
+      // always manage trades you've already opened, manually or otherwise.
       currentOrders.forEach(order=>{
-        if(!order.isDemo)return;
         const price=currentPrices[order.pair];if(!price)return;
         const isBuy=order.side==="BUY";
 
@@ -1310,7 +1443,7 @@ function AutoTradeEngine({isDemo,autoMode,signals,prices,strategy,openOrders,can
         const hitSL=isBuy?price<=effectiveSL:price>=effectiveSL;
         if(hitSL){
           onCloseOrder(order.id,"sl");
-          consecutiveLosses.current++;
+          if(order.isDemo)consecutiveLosses.current++;
           delete trailHighWater.current[order.id];
           onLog({type:"SL",pair:order.pair,price,side:order.side,time:new Date().toLocaleTimeString(),isDemo:order.isDemo});
           return;
@@ -1319,19 +1452,21 @@ function AutoTradeEngine({isDemo,autoMode,signals,prices,strategy,openOrders,can
         if(!order.tp1Hit&&order.tp&&(isBuy?price>=order.tp:price<=order.tp)){
           onLog({type:"TP1",pair:order.pair,price,side:order.side,time:new Date().toLocaleTimeString(),isDemo:order.isDemo});
           onCloseOrder(order.id,"tp1");
-          consecutiveLosses.current=0;
+          if(order.isDemo)consecutiveLosses.current=0;
           return;
         }
         // TP2
         if(order.tp1Hit&&order.tp2&&(isBuy?price>=order.tp2:price<=order.tp2)){
           onCloseOrder(order.id,"tp2");
-          consecutiveLosses.current=0;
+          if(order.isDemo)consecutiveLosses.current=0;
           delete trailHighWater.current[order.id];
           onLog({type:"TP2",pair:order.pair,price,side:order.side,time:new Date().toLocaleTimeString(),isDemo:order.isDemo});
           return;
         }
       });
 
+      // Auto-entry (opening NEW trades from signals) stays demo + auto-mode gated for safety
+      if(!isDemo||autoMode==="OFF")return;
       if(autoMode==="SEMI-AUTO")return;
       const maxTrades=parseInt(strategy.maxTrades)||3;
       const minRR=parseFloat(strategy.minRR)||2.5;
@@ -1380,13 +1515,27 @@ function AutoTradeEngine({isDemo,autoMode,signals,prices,strategy,openOrders,can
           const kelly=calcKellySize(winRateActual,sig.riskReward||2,currentBalance,parseFloat(strategy.maxKellyRisk)||5);
           effectiveRiskPct=kelly.recommended?kelly.riskPct:effRiskPct;
         }
-        const riskAmount=currentBalance*(effectiveRiskPct/100);
+        // Robustness-based gating: use Walk-Forward consistency + Monte Carlo
+        // ruin risk (once applied via the Backtest tab) to protect real
+        // auto-trades from strategies that only tested well by luck.
+        let robustnessMultiplier=1;
+        if(!isTestMode&&strategy.walkForwardConsistency!==undefined){
+          if(strategy.walkForwardConsistency<25)return;
+          else if(strategy.walkForwardConsistency<50)robustnessMultiplier*=0.5;
+          else if(strategy.walkForwardConsistency<75)robustnessMultiplier*=0.75;
+        }
+        if(!isTestMode&&strategy.monteCarloProbRuin!==undefined){
+          if(strategy.monteCarloProbRuin>20)return;
+          else if(strategy.monteCarloProbRuin>10)robustnessMultiplier*=0.5;
+          else if(strategy.monteCarloProbRuin>5)robustnessMultiplier*=0.75;
+        }
+        const riskAmount=currentBalance*(effectiveRiskPct/100)*robustnessMultiplier;
         const slDistance=Math.abs(price-sig.stopLoss)||price*0.01;
         const autoQty=Math.min(riskAmount/slDistance,balance*0.1/price);
         lastTradeTime.current[pair]=Date.now();
         dailyCount.current++;
         onPlaceOrder({pair,mode:"spot",side:isBuy?"BUY":"SELL",orderType:"MARKET",qty:Math.max(0.0001,Math.round(autoQty*10000)/10000),price,sl:sig.stopLoss,tp:sig.tp1,tp2:sig.tp2,tp3:sig.tp3,tp1Pct:40,tp2Pct:40,tp3Pct:20,leverage:1,autoPlaced:true,useOCO:true,useTrail:strategy.autoTrail||false,trailPct:parseFloat(strategy.trailPct||1.5),trailAtr:2,trailType:"pct",useBE:true,atr:sig.atr});
-        onLog({type:"OPEN",pair,price,side:isBuy?"BUY":"SELL",signal:sig.direction,strength:Math.round(sig.strength),rr:fmt(sig.riskReward,1),regime:sig.regime?.regime||"unknown",time:new Date().toLocaleTimeString(),isDemo:true});
+        onLog({type:"OPEN",pair,price,side:isBuy?"BUY":"SELL",signal:sig.direction,strength:Math.round(sig.strength),rr:fmt(sig.riskReward,1),regime:sig.regime?.regime||"unknown",time:new Date().toLocaleTimeString(),isDemo:true,robustnessMultiplier:robustnessMultiplier<1?robustnessMultiplier:undefined});
       });
     },3000);
     return()=>clearInterval(iv);
@@ -1418,6 +1567,7 @@ function AutoLog({logs,autoMode,isDemo,onClear}){
             <span style={{color:log.side==="BUY"?C.green:C.red,fontSize:10,minWidth:28}}>{log.side}</span>
             {log.signal&&<Badge color={C.cyan} small>{log.signal} {log.strength}%</Badge>}
             {log.regime&&<Badge color={C.slate} small>{log.regime}</Badge>}
+            {log.robustnessMultiplier&&<Badge color={C.purple} small>SIZE ×{log.robustnessMultiplier}</Badge>}
             {log.rr&&<span style={{color:C.gold,fontSize:9}}>1:{log.rr}</span>}
             <span style={{color:C.slate,fontSize:9,marginLeft:"auto"}}>{log.time}</span>
           </div>
@@ -1637,6 +1787,7 @@ OPEN POSITIONS (${isDemo?"DEMO":"LIVE"}): ${openPos.length}
 ${openPos.map(o=>"- "+o.pair+" "+o.side+" "+o.qty+" @ "+fmtUSD(o.price)+" SL:"+fmtUSD(o.sl)+" TP:"+fmtUSD(o.tp)).join("\n")||"None"}
 ACCOUNT: Balance ${fmtUSD(portfolio?.balance||(isDemo?50000:0))} | Win Rate ${winRate}% from ${(tradeHistory||[]).length} trades
 Strategy: ${strategy?.name||"Custom"} | Auto: ${strategy?.autoMode||"OFF"} | Min Strength: ${strategy?.minStrength||72}%
+Walk-Forward Consistency: ${strategy?.walkForwardConsistency!==undefined?strategy.walkForwardConsistency+"% of tested periods were profitable":"not tested yet"} | Monte Carlo Ruin Risk: ${strategy?.monteCarloProbRuin!==undefined?strategy.monteCarloProbRuin+"%":"not tested yet"}
 RECENT TRADES:
 ${recentTrades.map(t=>"- "+t.pair+" "+t.side+" "+(t.status||"")+" P&L: "+fmtUSD(t.pnl||0)).join("\n")||"No trades yet"}
 Answer concisely using this real data. Be specific and reference actual numbers.`;
@@ -2049,12 +2200,15 @@ function TradingApp({user,onSignOut}){
   const [notifications,setNotifications]=useState([]);
   const [keySaved,setKeySaved]=useState(false);
   const [savedMsg,setSavedMsg]=useState(false);
+  const [saveError,setSaveError]=useState("");
   const [dbSyncing,setDbSyncing]=useState(false);
   const [newAlert,setNewAlert]=useState({pair:"BTC/USDT",type:"price_above",value:""});
   const [alertMode,setAlertMode]=useState("simple");
   const [compoundPair,setCompoundPair]=useState("BTC/USDT");
   const [compoundConditions,setCompoundConditions]=useState([{field:"rsi",op:"<",value:"30"}]);
   const [webhookUrl,setWebhookUrl]=useState(()=>lLoad("webhook_"+uid,""));
+  const [telegramBotToken,setTelegramBotToken]=useState(()=>lLoad("tgtoken_"+uid,""));
+  const [telegramChatId,setTelegramChatId]=useState(()=>lLoad("tgchat_"+uid,""));
   const [serverBot,setServerBot]=useState(()=>lLoad("server_bot_"+uid,{enabled:false,lastRun:null,nextRun:null,status:"idle"}));
   const [serverTrades,setServerTrades]=useState([]);
   const [notifications2,setNotifications2]=useState([]);
@@ -2068,7 +2222,15 @@ function TradingApp({user,onSignOut}){
   useEffect(()=>{lSave("sp_"+uid,selectedPair);},[selectedPair,uid]);
   useEffect(()=>{lSave("tf_"+uid,timeframe);},[timeframe,uid]);
   useEffect(()=>{lSave("tab_"+uid,tab);},[tab,uid]);
-  useEffect(()=>{lSave("demo_"+uid,isDemo);},[isDemo,uid]);
+  useEffect(()=>{
+    lSave("demo_"+uid,isDemo);
+    // Push immediately to Supabase so switching modes is never lost if the
+    // app closes before the next periodic 30s sync — previously a stale
+    // synced value could silently overwrite a fresh local switch on reload.
+    if(uid){
+      (async()=>{try{await supabase.from("settings").upsert({id:uid,is_demo:isDemo,updated_at:new Date().toISOString()});}catch(e){}})();
+    }
+  },[isDemo,uid]);
   useEffect(()=>{lSave("live_port_"+uid,livePortfolio);},[livePortfolio,uid]);
   useEffect(()=>{lSave("demo_port_"+uid,demoPortfolio);},[demoPortfolio,uid]);
   useEffect(()=>{lSave("demo_bal_"+uid,demoBalance);},[demoBalance,uid]);
@@ -2123,7 +2285,7 @@ function TradingApp({user,onSignOut}){
         if(sett){
           if(sett.strategy&&Object.keys(sett.strategy).length>0){setStrategy(sett.strategy);lSave("strat_"+uid,sett.strategy);}
           if(sett.active_pairs?.length>0){setActivePairs(sett.active_pairs);lSave("pairs_"+uid,sett.active_pairs);}
-          if(typeof sett.is_demo==="boolean"){setIsDemo(sett.is_demo);lSave("demo_mode_"+uid,sett.is_demo);}
+          if(typeof sett.is_demo==="boolean"){setIsDemo(sett.is_demo);lSave("demo_"+uid,sett.is_demo);}
           if(sett.exchange)setActiveExchange(sett.exchange);
           if(sett.selected_pair)setSelectedPair(sett.selected_pair);
           if(sett.timeframe)setTimeframe(sett.timeframe);
@@ -2158,16 +2320,30 @@ function TradingApp({user,onSignOut}){
         // Load bot config
         const{data:botCfg}=await supabase.from("bot_config").select("*").eq("user_id",uid).single();
         if(botCfg)setServerBot({enabled:botCfg.enabled,lastRun:botCfg.last_run,nextRun:botCfg.next_run,status:botCfg.status||"idle"});
-        // Restore trades from DB if local is empty
-        const localDemoTrades=lLoad("demo_history_"+uid,[]);
-        const localLiveTrades=lLoad("live_history_"+uid,[]);
-        if(localDemoTrades.length===0&&localLiveTrades.length===0){
-          const{data:trades}=await supabase.from("trades").select("*").eq("user_id",uid).order("created_at",{ascending:false}).limit(200);
-          if(trades&&trades.length>0){
-            const mapped=trades.map(t=>({id:t.id,pair:t.pair,mode:t.mode||"SPOT",side:t.side,qty:t.qty,price:t.price,closePrice:t.close_price,pnl:t.pnl,pnlPct:t.pnl_pct,leverage:t.leverage||1,time:t.time,status:"CLOSED",autoPlaced:t.auto_placed,isDemo:t.is_demo}));
-            setDemoTradeHistory(mapped.filter(t=>t.isDemo));
-            setLiveTradeHistory(mapped.filter(t=>!t.isDemo));
-          }
+        // Restore balance — was being pushed to Supabase but never read back,
+        // which meant a second device never saw your actual current balance.
+        const{data:port}=await supabase.from("portfolio").select("*").eq("id",uid).single();
+        if(port){
+          if(typeof port.demo_balance==="number"){setDemoBalance(port.demo_balance);lSave("demo_bal_"+uid,port.demo_balance);}
+          if(typeof port.live_balance==="number"){setLiveBalance(port.live_balance);lSave("live_bal_"+uid,port.live_balance);}
+        }
+        // Trade history — always pull latest from Supabase and merge with any
+        // local-only entries, rather than only checking when local is empty.
+        // The old "only if empty" check meant a device that already had ANY
+        // cached trades would never see newer trades made on another device.
+        const{data:trades}=await supabase.from("trades").select("*").eq("user_id",uid).order("created_at",{ascending:false}).limit(200);
+        if(trades){
+          const mapped=trades.map(t=>({id:t.id,pair:t.pair,mode:t.mode||"SPOT",side:t.side,qty:t.qty,price:t.price,closePrice:t.close_price,pnl:t.pnl,pnlPct:t.pnl_pct,leverage:t.leverage||1,time:t.time,status:"CLOSED",autoPlaced:t.auto_placed,isDemo:t.is_demo}));
+          const dbDemo=mapped.filter(t=>t.isDemo);
+          const dbLive=mapped.filter(t=>!t.isDemo);
+          const localDemo=lLoad("demo_history_"+uid,[])||[];
+          const localLive=lLoad("live_history_"+uid,[])||[];
+          const dbDemoIds=new Set(dbDemo.map(t=>t.id));
+          const dbLiveIds=new Set(dbLive.map(t=>t.id));
+          const mergedDemo=[...dbDemo,...localDemo.filter(t=>!dbDemoIds.has(t.id))].slice(0,200);
+          const mergedLive=[...dbLive,...localLive.filter(t=>!dbLiveIds.has(t.id))].slice(0,200);
+          setDemoTradeHistory(mergedDemo);setLiveTradeHistory(mergedLive);
+          lSave("demo_history_"+uid,mergedDemo);lSave("live_history_"+uid,mergedLive);
         }
       }catch(e){}
     }
@@ -2408,28 +2584,42 @@ function TradingApp({user,onSignOut}){
 
   function addAutoLog(entry){setAutoLog(prev=>[...prev,entry].slice(-100));}
   useEffect(()=>{lSave("webhook_"+uid,webhookUrl);},[webhookUrl,uid]);
-  function sendWebhookAlert(alert){
-    if(!webhookUrl)return;
+  useEffect(()=>{lSave("tgtoken_"+uid,telegramBotToken);},[telegramBotToken,uid]);
+  useEffect(()=>{lSave("tgchat_"+uid,telegramChatId);},[telegramChatId,uid]);
+  function buildAlertText(alert){
     let text="🔔 NEXUS Alert: "+alert.pair+" — ";
     if(alert.type==="compound"&&Array.isArray(alert.conditions)){
       text+=alert.conditions.map(c=>c.field+" "+c.op+" "+c.value).join(" AND ");
     }else{
       text+=(alert.type||"").replace("_"," ")+" "+(alert.value||"");
     }
-    const isDiscord=webhookUrl.includes("discord.com");
-    const body=isDiscord?JSON.stringify({content:text}):JSON.stringify({text});
-    fetch(webhookUrl,{method:"POST",headers:{"Content-Type":"application/json"},body}).catch(()=>{});
+    return text;
+  }
+  function sendWebhookAlert(alert){
+    const text=buildAlertText(alert);
+    if(webhookUrl){
+      const isDiscord=webhookUrl.includes("discord.com");
+      const body=isDiscord?JSON.stringify({content:text}):JSON.stringify({text});
+      fetch(webhookUrl,{method:"POST",headers:{"Content-Type":"application/json"},body}).catch(()=>{});
+    }
+    if(telegramBotToken&&telegramChatId){
+      fetch(SUPABASE_URL+"/functions/v1/nexus-telegram-proxy",{
+        method:"POST",
+        headers:{"Content-Type":"application/json","Authorization":"Bearer "+SUPABASE_KEY},
+        body:JSON.stringify({botToken:telegramBotToken,chatId:telegramChatId,text})
+      }).catch(()=>{});
+    }
   }
   function handleAlert(alert){setNotifications(prev=>[{...alert,firedAt:new Date().toLocaleTimeString()},...prev].slice(0,5));sendWebhookAlert(alert);}
   function saveApiKey(){
     lSave("apikey_"+uid,apiKey);
     setKeySaved(true);setTimeout(()=>setKeySaved(false),2000);
     if(uid){
-      supabase.from("settings").upsert({
+      (async()=>{try{await supabase.from("settings").upsert({
         id:uid,strategy,active_pairs:activePairs,is_demo:isDemo,
         exchange:activeExchange,api_key:apiKey||null,
         updated_at:new Date().toISOString()
-      }).catch(()=>{});
+      });}catch(e){}})();
     }
   }
   function saveStrategy(){
@@ -2437,15 +2627,23 @@ function TradingApp({user,onSignOut}){
     syncToSupabase();
     // Also sync strategy to settings immediately
     if(uid){
-      supabase.from("settings").upsert({
-        id:uid,strategy,
-        active_pairs:activePairs,
-        is_demo:isDemo,
-        exchange:activeExchange,
-        updated_at:new Date().toISOString()
-      }).catch(()=>{});
+      (async()=>{
+        try{
+          const{error}=await supabase.from("settings").upsert({
+            id:uid,strategy,
+            active_pairs:activePairs,
+            is_demo:isDemo,
+            exchange:activeExchange,
+            updated_at:new Date().toISOString()
+          });
+          if(error){setSaveError("Saved locally, but cloud sync failed: "+error.message);setTimeout(()=>setSaveError(""),4000);}
+        }catch(e){
+          setSaveError("Saved locally, but cloud sync failed: "+(e?.message||"network error"));setTimeout(()=>setSaveError(""),4000);
+        }
+      })();
     }
-    setSavedMsg(true);setTimeout(()=>setSavedMsg(false),2000);
+    setSavedMsg(true);setTimeout(()=>setSavedMsg(false),3000);
+    setNotifications(prev=>[{pair:"STRATEGY",type:"signal",value:"Settings saved",firedAt:new Date().toLocaleTimeString()},...prev].slice(0,5));
   }
 
   async function toggleServerBot(enabled){
@@ -2492,9 +2690,9 @@ function TradingApp({user,onSignOut}){
   const currentBalance=isDemo?demoBalance:liveBalance;
   const filteredPairs=activePairs.filter(p=>p.toLowerCase().includes(pairSearch.toLowerCase()));
   const STRATEGY_PRESETS=[
-    {label:"NEXUS Prime",s:{name:"NEXUS Prime",riskPct:1.5,maxTrades:3,minRR:2.5,minStrength:72,sessionFilter:true,correlationFilter:true,volatilityFilter:true,mtfFilter:true,regimeFilter:true,autoTrail:true,trailPct:1.5,description:"NEXUS PRIME STRATEGY — High Probability, Minimal Risk\n\nCORE PHILOSOPHY\nOnly trade the absolute best setups. Missing a trade costs nothing. A bad trade costs real money. Patience is the edge.\n\nENTRY REQUIREMENTS — ALL must be true:\n1. Signal strength above 72% minimum\n2. R:R ratio minimum 1:2.5 — never compromise this\n3. RSI between 28-38 for longs, 62-72 for shorts\n4. Price must be on correct side of VWAP\n5. EMA21 and EMA50 must agree on trend direction\n6. MACD histogram must confirm signal direction\n7. Supertrend must agree with trade direction\n8. Volume at least 1.3x average — confirms conviction\n9. Do NOT trade within 30 minutes of major news\n10. Do NOT trade if spread is unusually wide\n\nTIMEFRAME RULES\n- 4H chart for trend direction — master timeframe\n- 1H chart to find entry zone\n- 15M chart for precise entry timing\n- All three timeframes should agree\n\nPOSITION SIZING\n- Risk exactly 1.5% of account per trade\n- Calculate: Risk Amount divided by distance to SL\n- Never increase size after a loss\n\nSTOP LOSS RULES\n- Place SL below nearest support for longs\n- Place SL above nearest resistance for shorts\n- Use ATR x1.5 as minimum SL distance\n- Never move SL against your position\n\nTAKE PROFIT\n- TP1 at 2x risk — close 40%\n- TP2 at 4x risk — close 40%\n- TP3 trail remaining 20%\n- Move SL to breakeven at TP1\n\nWHEN NOT TO TRADE\n- After 2 consecutive losses — take a break\n- If daily loss limit of 3% is hit — stop\n- Extreme Fear and Greed above 85 or below 15\n- If feeling emotional, tired or rushed\n\nMINDSET\nExpect 40% of trades to hit SL — that is normal.\nWith 1:2.5 R:R you only need 30% win rate to profit.\nConsistency beats perfection. Waiting is a position."}},{label:"Trend Rider",s:{name:"NEXUS Trend Rider",riskPct:2,maxTrades:3,minRR:2,minStrength:65,sessionFilter:false,correlationFilter:false,regimeFilter:true,volatilityFilter:false,mtfFilter:false,autoMode:"FULL-AUTO",useTrail:true,trailType:"ATR",trailAtr:2,useBE:true,tp1Pct:30,tp2Pct:30,tp3Pct:40,description:"Trend following with trailing stop. 30% at TP1 (BE), 30% at TP2. 40% trails 2x ATR letting winners run indefinitely until reversal."}},
+    {label:"NEXUS Prime",s:{name:"NEXUS Prime",riskPct:1.5,maxTrades:3,minRR:2.5,minStrength:72,sessionFilter:true,correlationFilter:true,volatilityFilter:true,mtfFilter:true,regimeFilter:true,autoTrail:true,trailPct:1.5,sizingMode:"kelly",maxKellyRisk:2,description:"NEXUS PRIME STRATEGY — High Probability, Minimal Risk\n\nCORE PHILOSOPHY\nOnly trade the absolute best setups. Missing a trade costs nothing. A bad trade costs real money. Patience is the edge.\n\nENTRY REQUIREMENTS — ALL must be true:\n1. Signal strength above 72% minimum\n2. R:R ratio minimum 1:2.5 — never compromise this\n3. RSI between 28-38 for longs, 62-72 for shorts\n4. Price must be on correct side of VWAP\n5. EMA21 and EMA50 must agree on trend direction\n6. MACD histogram must confirm signal direction\n7. Supertrend must agree with trade direction\n8. Volume at least 1.3x average — confirms conviction\n9. Do NOT trade within 30 minutes of major news\n10. Do NOT trade if spread is unusually wide\n\nTIMEFRAME RULES\n- 4H chart for trend direction — master timeframe\n- 1H chart to find entry zone\n- 15M chart for precise entry timing\n- All three timeframes should agree\n\nPOSITION SIZING\n- Uses Kelly Criterion once you have 10+ closed trades, based on your real win rate and R:R — capped at 2% max per trade to stay true to \"minimal risk\"\n- Falls back to a flat 1.5% before you have enough trade history\n- Never increase size after a loss\n\nSTOP LOSS RULES\n- Place SL below nearest support for longs\n- Place SL above nearest resistance for shorts\n- Use ATR x1.5 as minimum SL distance\n- Never move SL against your position\n\nTAKE PROFIT\n- TP1 at 2x risk — close 40%\n- TP2 at 4x risk — close 40%\n- TP3 trail remaining 20%\n- Move SL to breakeven at TP1\n\nWHEN NOT TO TRADE\n- After 2 consecutive losses — take a break\n- If daily loss limit of 3% is hit — stop\n- Extreme Fear and Greed above 85 or below 15\n- If feeling emotional, tired or rushed\n\nMINDSET\nExpect 40% of trades to hit SL — that is normal.\nWith 1:2.5 R:R you only need 30% win rate to profit.\nConsistency beats perfection. Waiting is a position."}},{label:"Trend Rider",s:{name:"NEXUS Trend Rider",riskPct:2,maxTrades:3,minRR:2,minStrength:65,sessionFilter:false,correlationFilter:true,regimeFilter:true,volatilityFilter:false,mtfFilter:true,autoMode:"FULL-AUTO",useTrail:true,trailType:"ATR",trailAtr:2,useBE:true,tp1Pct:30,tp2Pct:30,tp3Pct:40,description:"Trend following with trailing stop. 30% at TP1 (BE), 30% at TP2. 40% trails 2x ATR letting winners run indefinitely until reversal.\n\nUPDATED: now requires multi-timeframe (15m/1h/4h) agreement before entry — a real trend should show up on more than one timeframe, so this filters out noise without changing the core ride-it-out approach. Correlation filter also added so it won't stack multiple correlated trend trades (e.g. BTC and ETH both trending simultaneously) without you realizing the combined exposure. Session and volatility filters stay off deliberately — genuine trends don't wait for a specific session, and often involve above-average volatility, so restricting those would work against this strategy's purpose."}},
     {label:"Aggressive",s:{name:"Aggressive",riskPct:3,maxTrades:5,minRR:2,minStrength:60,sessionFilter:false,correlationFilter:false,volatilityFilter:false,mtfFilter:false,regimeFilter:false,autoTrail:true,trailPct:2,description:"AGGRESSIVE STRATEGY — Higher Risk, More Trades\n\nFor experienced traders comfortable with higher volatility.\n\nSETTINGS\n- Risk 3% per trade\n- Up to 5 trades per day\n- Minimum R:R 1:2\n- Minimum signal strength 60%\n- All filters disabled for maximum opportunities\n- Auto trailing stop at 2%\n\nRULES\n- Enter on BUY or SELL signals above 60% strength\n- Always use stop loss — no exceptions\n- Scale out at TP1, TP2, TP3\n- Trailing stop locks in profits automatically\n\nRISK WARNING\nHigher risk means larger drawdowns are possible.\nOnly use with real money after profitable demo period."}},
-    {label:"TEST (any trade)",s:{name:"TEST MODE",riskPct:1,maxTrades:10,minRR:1,minStrength:20,sessionFilter:false,correlationFilter:false,volatilityFilter:false,mtfFilter:false,regimeFilter:false,autoTrail:false,trailPct:1.5,description:"TEST MODE — For verifying auto trading works\n\nThis strategy is intentionally loose to trigger trades quickly.\n\nSETTINGS\n- Signal strength minimum: 20% (fires on almost any signal)\n- R:R minimum: 1:1 (very low bar)\n- Max 10 trades per day\n- All filters disabled\n- 30 second cooldown between trades\n- No trailing stop\n\nHOW TO USE\n1. Select TEST preset\n2. Set Auto Mode to FULL-AUTO\n3. Save Strategy\n4. Enable Demo Mode\n5. Watch Auto Trade Log — trades appear within 30 seconds\n\nIMPORTANT\nDo NOT use with real money.\nSwitch back to NEXUS Prime for real trading."}},
+    {label:"NEXUS Apex",s:{name:"NEXUS Apex",riskPct:1,maxTrades:2,minRR:3,minStrength:80,sessionFilter:true,correlationFilter:true,volatilityFilter:true,mtfFilter:true,regimeFilter:true,autoTrail:true,trailPct:1.2,sizingMode:"kelly",maxKellyRisk:3,dailyLossLimit:3,description:"NEXUS APEX — Maximum Confluence Strategy\n\nPHILOSOPHY\nThis is the most selective, most demanding strategy NEXUS can run. It requires nearly every analytical system in the app to agree before it will even consider a trade — regime, multi-timeframe trend, session timing, volatility, correlation, and a very high combined signal score. Most days it will find zero trades. That is by design, not a flaw.\n\nHONEST EXPECTATIONS\nNo strategy — this one included — can guarantee a winning trade, and backtested performance never guarantees future results. Apex is built to stack the odds as far in your favour as the available data allows, and to refuse to trade when conditions aren't genuinely favourable. Treat it as a rigorous filter, not a promise.\n\nENTRY REQUIREMENTS\n- Signal strength minimum 80% — one of the highest confluence bars in the app\n- R:R minimum 1:3 — only takes asymmetric setups\n- Regime must be tradeable — no ranging, choppy or volatile conditions\n- Multi-timeframe (15m/1h/4h) must agree\n- Correct trading session only\n- Correlation filter active — won't stack correlated pairs at once\n- Volatility filter active — avoids abnormal ATR conditions\n\nPOSITION SIZING\nUses Kelly Criterion once you have 10+ closed trades, calculated from your actual win rate and R:R — capped at 3% max per trade for safety. Before that, falls back to a flat 1% risk.\n\nBEFORE TRUSTING THIS WITH REAL MONEY\nRun Walk-Forward and Monte Carlo simulation (Backtest tab) on this exact strategy first, then apply the results. If consistency comes back low or ruin risk comes back high, NEXUS will automatically reduce size or pause auto-trading on this strategy until you've reworked it — that safety net exists specifically so a strategy this selective doesn't get blind trust it hasn't earned yet.\n\nMINDSET\nFewer trades. Higher quality. No guarantees — just genuinely stacked odds."}},
     {label:"Small Account",s:{name:"Small Account $100",riskPct:3,maxTrades:2,minRR:3,minStrength:75,sessionFilter:true,correlationFilter:true,volatilityFilter:true,mtfFilter:true,regimeFilter:true,autoTrail:true,trailPct:1,description:"SMALL ACCOUNT GROWTH — $100 to $1,000\n\nDesigned for accounts starting at $100-$500 using futures with 5x leverage.\n\nSETTINGS\n- Risk 3% per trade\n- Maximum 2 trades per day\n- Minimum R:R 1:3\n- Minimum signal strength 75%\n- All smart filters enabled\n- Auto trailing stop at 1%\n\nPAIRS TO TRADE\nBTC/USDT, ETH/USDT, SOL/USDT only\n\nLEVERAGE\nUse 5x maximum on futures. Never higher.\nStop loss is not optional — it is your protection.\n\nGROWTH TARGET (50% win rate, 1:3 R:R)\nMonth 1: $100 → ~$180\nMonth 3: ~$580\nMonth 6: ~$3,400\n\nRULES\n- Only trade London or NY session\n- Stop after any loss — max 1 loss per day\n- Reinvest all profits for compound growth\n- Never add to a losing position"}},
   ];
 
@@ -2714,7 +2912,7 @@ function TradingApp({user,onSignOut}){
                 </div>}
 
                 {subTab==="analysis"&&<AIAnalysisPanel pair={selectedPair} signal={sig} price={price} timeframe={timeframe} isDemo={isDemo} apiKey={apiKey}/>}
-                {subTab==="backtest"&&<BacktestPanel candles={candleData[selectedPair]||[]} strategy={strategy} pair={selectedPair}/>}
+                {subTab==="backtest"&&<BacktestPanel candles={candleData[selectedPair]||[]} strategy={strategy} pair={selectedPair} setStrategy={setStrategy}/>}
                 {subTab==="news"&&<div style={{display:"flex",flexDirection:"column",gap:7}}>
                   <div style={{background:C.bg2,borderRadius:6,padding:10,marginBottom:4,border:"1px solid "+C.border}}>
                     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
@@ -3117,14 +3315,56 @@ function TradingApp({user,onSignOut}){
 
         {tab==="strategy"&&(
           <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(300px,1fr))",gap:14}}>
+            <div style={{background:C.bg1,border:"1px solid "+C.border,borderRadius:8,padding:20,gridColumn:"1 / -1"}}>
+              <div style={{color:C.cyan,fontSize:11,letterSpacing:"0.1em",marginBottom:4,fontWeight:700}}>◈ SIGNAL QUALIFICATION</div>
+              <div style={{color:C.dimText,fontSize:9,marginBottom:12}}>Which active pairs currently meet this strategy's minimum strength and R:R to actually trade.</div>
+              {(()=>{
+                const minStrength=parseFloat(strategy.minStrength)||72;
+                const minRR=parseFloat(strategy.minRR)||2.5;
+                const rows=activePairs.map(p=>{
+                  const s=signals[p];
+                  const pairOv=strategy.pairOverrides&&strategy.pairOverrides[p];
+                  const effMinStrength=pairOv&&pairOv.minStrength!==undefined?pairOv.minStrength:minStrength;
+                  const effMinRR=pairOv&&pairOv.minRR!==undefined?pairOv.minRR:minRR;
+                  const strengthOk=s&&s.strength>=effMinStrength;
+                  const rrOk=s&&s.riskReward>=effMinRR;
+                  const directionOk=s&&s.direction!=="NEUTRAL";
+                  const qualifies=!!(s&&strengthOk&&rrOk&&directionOk);
+                  return{pair:p,sig:s,strengthOk,rrOk,directionOk,qualifies,effMinStrength,effMinRR};
+                });
+                const qualifyCount=rows.filter(r=>r.qualifies).length;
+                return(<>
+                  <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12,background:C.bg2,borderRadius:6,padding:"10px 14px"}}>
+                    <div style={{color:qualifyCount>0?C.green:C.slate,fontSize:22,fontWeight:700}}>{qualifyCount}</div>
+                    <div style={{color:C.slate,fontSize:11}}>of {activePairs.length} active pairs currently qualify to trade under this strategy</div>
+                  </div>
+                  <div style={{display:"flex",flexDirection:"column",gap:5,maxHeight:280,overflowY:"auto"}}>
+                    {rows.map(r=>(
+                      <div key={r.pair} style={{display:"flex",alignItems:"center",gap:10,padding:"6px 10px",background:r.qualifies?C.greenDim:C.bg2,borderRadius:5,border:"1px solid "+(r.qualifies?C.green+"44":C.border)}}>
+                        <span style={{color:C.white,fontSize:10,fontWeight:700,minWidth:90}}>{r.pair}</span>
+                        {!r.sig?<span style={{color:C.dimText,fontSize:9}}>loading…</span>:<>
+                          <div style={{display:"flex",alignItems:"center",gap:4,minWidth:110}}>
+                            <div style={{width:50,height:5,background:C.bg0,borderRadius:2}}><div style={{width:Math.min(100,r.sig.strength)+"%",height:"100%",background:r.strengthOk?C.green:C.red,borderRadius:2}}/></div>
+                            <span style={{color:r.strengthOk?C.green:C.red,fontSize:9}}>{Math.round(r.sig.strength)}%</span>
+                          </div>
+                          <span style={{color:r.rrOk?C.green:C.red,fontSize:9,minWidth:55}}>R:R {fmt(r.sig.riskReward,1)}</span>
+                          <span style={{color:r.directionOk?C.white:C.slate,fontSize:9,minWidth:70}}>{r.sig.direction}</span>
+                          <Badge color={r.qualifies?C.green:C.red} small>{r.qualifies?"QUALIFIES":"NO"}</Badge>
+                        </>}
+                      </div>
+                    ))}
+                  </div>
+                </>);
+              })()}
+            </div>
             <div style={{background:C.bg1,border:"1px solid "+C.border,borderRadius:8,padding:20}}>
               <div style={{color:C.cyan,fontSize:11,letterSpacing:"0.1em",marginBottom:14,fontWeight:700}}>◈ STRATEGY PRESETS</div>
               <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:14}}>
-                {[{n:"NEXUS Prime",s:{name:"NEXUS Prime",riskPct:1.5,maxTrades:3,minRR:2.5,minStrength:72,sessionFilter:true,correlationFilter:true,regimeFilter:true,volatilityFilter:true,mtfFilter:true,autoMode:"FULL-AUTO",useTrail:false,useBE:true,tp1Pct:40,tp2Pct:40,tp3Pct:20,dailyLoss:5}},
-                  {n:"Trend Rider",s:{name:"NEXUS Trend Rider",riskPct:2,maxTrades:3,minRR:2,minStrength:65,sessionFilter:false,correlationFilter:false,regimeFilter:true,volatilityFilter:false,mtfFilter:false,autoMode:"FULL-AUTO",useTrail:true,trailType:"ATR",trailAtr:2,useBE:true,tp1Pct:30,tp2Pct:30,tp3Pct:40,dailyLoss:6}},
+                {[{n:"NEXUS Prime",s:{name:"NEXUS Prime",riskPct:1.5,maxTrades:3,minRR:2.5,minStrength:72,sessionFilter:true,correlationFilter:true,regimeFilter:true,volatilityFilter:true,mtfFilter:true,autoMode:"FULL-AUTO",useTrail:false,useBE:true,tp1Pct:40,tp2Pct:40,tp3Pct:20,dailyLoss:5,sizingMode:"kelly",maxKellyRisk:2}},
+                  {n:"Trend Rider",s:{name:"NEXUS Trend Rider",riskPct:2,maxTrades:3,minRR:2,minStrength:65,sessionFilter:false,correlationFilter:true,regimeFilter:true,volatilityFilter:false,mtfFilter:true,autoMode:"FULL-AUTO",useTrail:true,trailType:"ATR",trailAtr:2,useBE:true,tp1Pct:30,tp2Pct:30,tp3Pct:40,dailyLoss:6}},
                   {n:"Aggressive",s:{name:"Aggressive",riskPct:3,maxTrades:5,minRR:2,minStrength:60,sessionFilter:false,correlationFilter:false,regimeFilter:false,volatilityFilter:false,mtfFilter:false,autoMode:"FULL-AUTO",useTrail:false,useBE:false,tp1Pct:40,tp2Pct:40,tp3Pct:20,dailyLoss:10}},
                   {n:"Small Account",s:{name:"Small Account $100",riskPct:3,maxTrades:2,minRR:3,minStrength:75,sessionFilter:false,correlationFilter:true,regimeFilter:true,volatilityFilter:false,mtfFilter:false,autoMode:"SEMI-AUTO",useTrail:true,trailType:"ATR",trailAtr:1.5,useBE:true,tp1Pct:40,tp2Pct:30,tp3Pct:30,dailyLoss:6}},
-                  {n:"TEST MODE",s:{name:"TEST MODE",riskPct:1,maxTrades:10,minRR:1,minStrength:20,sessionFilter:false,correlationFilter:false,regimeFilter:false,volatilityFilter:false,mtfFilter:false,autoMode:"FULL-AUTO",useTrail:false,useBE:false,tp1Pct:50,tp2Pct:30,tp3Pct:20,dailyLoss:20}},
+                  {n:"NEXUS Apex",s:{name:"NEXUS Apex",riskPct:1,maxTrades:2,minRR:3,minStrength:80,sessionFilter:true,correlationFilter:true,regimeFilter:true,volatilityFilter:true,mtfFilter:true,autoMode:"SEMI-AUTO",useTrail:true,trailType:"ATR",trailAtr:1.5,useBE:true,tp1Pct:40,tp2Pct:40,tp3Pct:20,dailyLoss:3,sizingMode:"kelly",maxKellyRisk:3}},
                 ].map(({n,s})=>(
                   <button key={n} onClick={()=>setStrategy(prev=>({...prev,...s}))} style={{padding:"8px 6px",borderRadius:5,border:"1px solid "+(strategy.name===s.name?C.cyan:C.border),background:strategy.name===s.name?C.cyanDim:C.bg2,color:strategy.name===s.name?C.cyan:C.slate,cursor:"pointer",fontSize:9,fontFamily:"monospace",fontWeight:strategy.name===s.name?700:400}}>{n}</button>
                 ))}
@@ -3245,7 +3485,8 @@ function TradingApp({user,onSignOut}){
                   );
                 })}
               </div>
-              <button onClick={saveStrategy} style={{width:"100%",padding:"12px 0",borderRadius:6,border:"none",cursor:"pointer",background:savedMsg?C.green:C.cyan,color:"#000",fontWeight:700,fontFamily:"monospace",fontSize:13}}>{savedMsg?"✓ SAVED":"SAVE STRATEGY"}</button>
+              <button onClick={saveStrategy} style={{width:"100%",padding:"14px 0",borderRadius:6,border:savedMsg?"2px solid "+C.green:"none",cursor:"pointer",background:savedMsg?C.greenDim:C.cyan,color:savedMsg?C.green:"#000",fontWeight:700,fontFamily:"monospace",fontSize:14,transition:"all 0.15s"}}>{savedMsg?"✓ STRATEGY SAVED":"SAVE STRATEGY"}</button>
+              {saveError&&<div style={{marginTop:8,padding:"8px 10px",background:C.redDim,border:"1px solid "+C.red+"44",borderRadius:5,color:C.red,fontSize:10}}>{saveError}</div>}
             </div>
             <div style={{display:"flex",flexDirection:"column",gap:12}}>
               <div style={{background:C.bg1,border:"1px solid "+C.border,borderRadius:8,padding:20}}>
@@ -3291,9 +3532,12 @@ function TradingApp({user,onSignOut}){
               </div>
               <div style={{background:C.bg1,border:"1px solid "+C.border,borderRadius:8,padding:20}}>
                 <div style={{color:C.cyan,fontSize:11,letterSpacing:"0.1em",marginBottom:12,fontWeight:700}}>◈ LIVE SIGNAL STATUS</div>
-                {[["Session",isTradingSession()?"ACTIVE":"CLOSED",isTradingSession()?C.green:C.slate],["Regime",(sig?.advRegime?.regime||"?").replace("_"," "),(sig?.advRegime?.tradeable)?C.green:C.red],["MTF",(sig?.mtfBias?.bias||"neutral").toUpperCase()+(sig?.mtfBias?.confirmed?" ✓":""),sig?.mtfBias?.confirmed?C.cyan:C.slate],["Signal",sig?.direction||"—",sig?.direction?.includes("BUY")?C.green:sig?.direction?.includes("SELL")?C.red:C.slate],["Strength",sig?Math.round(sig.strength)+"%":"—",sig?.strength>=70?C.green:sig?.strength>=50?C.gold:C.red],["Auto Mode",strategy.autoMode,strategy.autoMode==="FULL-AUTO"?C.green:strategy.autoMode==="SEMI-AUTO"?C.cyan:C.red]].map(([l,v,c])=>(
+                {[["Session",isTradingSession()?"ACTIVE":"CLOSED",isTradingSession()?C.green:C.slate],["Regime",(sig?.advRegime?.regime||"?").replace("_"," "),(sig?.advRegime?.tradeable)?C.green:C.red],["MTF",(sig?.mtfBias?.bias||"neutral").toUpperCase()+(sig?.mtfBias?.confirmed?" ✓":""),sig?.mtfBias?.confirmed?C.cyan:C.slate],["Signal",sig?.direction||"—",sig?.direction?.includes("BUY")?C.green:sig?.direction?.includes("SELL")?C.red:C.slate],["Strength",sig?Math.round(sig.strength)+"%":"—",sig?.strength>=70?C.green:sig?.strength>=50?C.gold:C.red],["Auto Mode",strategy.autoMode,strategy.autoMode==="FULL-AUTO"?C.green:strategy.autoMode==="SEMI-AUTO"?C.cyan:C.red],["Walk-Forward",strategy.walkForwardConsistency!==undefined?strategy.walkForwardConsistency+"% consistent":"Not tested",strategy.walkForwardConsistency===undefined?C.slate:strategy.walkForwardConsistency>=75?C.green:strategy.walkForwardConsistency>=50?C.gold:C.red],["Ruin Risk",strategy.monteCarloProbRuin!==undefined?strategy.monteCarloProbRuin+"%":"Not tested",strategy.monteCarloProbRuin===undefined?C.slate:strategy.monteCarloProbRuin<5?C.green:strategy.monteCarloProbRuin<15?C.gold:C.red]].map(([l,v,c])=>(
                   <div key={l} style={{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:"1px solid "+C.border+"22"}}><span style={{color:C.slate,fontSize:10}}>{l}</span><span style={{color:c,fontSize:11,fontWeight:700}}>{v}</span></div>
                 ))}
+                {(strategy.walkForwardConsistency!==undefined||strategy.monteCarloProbRuin!==undefined)&&<div style={{background:C.purpleDim,border:"1px solid "+C.purple+"33",borderRadius:5,padding:"8px 10px",marginTop:10}}>
+                  <div style={{color:C.purple,fontSize:9,lineHeight:1.6}}>Robustness scores are active — auto-trading will automatically reduce position size (or pause) when this strategy's Walk-Forward consistency or Monte Carlo ruin risk indicates it isn't reliable. Re-run and re-apply after any strategy changes.</div>
+                </div>}
               </div>
             </div>
           </div>
@@ -3666,8 +3910,8 @@ function TradingApp({user,onSignOut}){
                 <div style={{color:C.cyan,fontSize:11,letterSpacing:"0.1em",marginBottom:12,fontWeight:700}}>◈ DATA MANAGEMENT</div>
                 <div style={{color:C.slate,fontSize:10,lineHeight:1.7,marginBottom:10}}>Clear all trading history and reset balances. This cannot be undone.</div>
                 <div style={{display:"flex",gap:8,marginBottom:8}}>
-                  <button onClick={()=>{if(window.confirm("Clear all DEMO trade history? Cannot be undone.")){setDemoTradeHistory([]);lSave("demo_history_"+uid,[]);setDemoBalance(50000);lSave("demo_bal_"+uid,50000);setDemoPortfolio({balance:50000,pnl:0,pnlPct:0,totalTrades:0,wins:0,losses:0,winRate:0,bestTrade:0,worstTrade:0,profitFactor:0,totalWinAmount:0,totalLossAmount:0});lSave("demo_port_"+uid,{balance:50000,pnl:0,pnlPct:0,totalTrades:0,wins:0,losses:0,winRate:0,bestTrade:0,worstTrade:0,profitFactor:0,totalWinAmount:0,totalLossAmount:0});setAutoLog([]);}}} style={{flex:1,padding:"8px 0",borderRadius:4,border:"1px solid "+C.purple,background:C.purpleDim,color:C.purple,cursor:"pointer",fontFamily:"monospace",fontSize:10,fontWeight:700}}>RESET DEMO DATA</button>
-                  <button onClick={()=>{if(window.confirm("Clear all LIVE trade history? Cannot be undone.")){setLiveTradeHistory([]);lSave("live_history_"+uid,[]);setLiveBalance(0);lSave("live_bal_"+uid,0);setLivePortfolio({balance:0,pnl:0,pnlPct:0,totalTrades:0,wins:0,losses:0,winRate:0,bestTrade:0,worstTrade:0,profitFactor:0,totalWinAmount:0,totalLossAmount:0});lSave("live_port_"+uid,{balance:0,pnl:0,pnlPct:0,totalTrades:0,wins:0,losses:0,winRate:0,bestTrade:0,worstTrade:0,profitFactor:0,totalWinAmount:0,totalLossAmount:0});}}} style={{flex:1,padding:"8px 0",borderRadius:4,border:"1px solid "+C.red,background:C.redDim,color:C.red,cursor:"pointer",fontFamily:"monospace",fontSize:10,fontWeight:700}}>RESET LIVE DATA</button>
+                  <button onClick={()=>{if(window.confirm("Clear all DEMO trade history? Cannot be undone.")){setDemoTradeHistory([]);lSave("demo_history_"+uid,[]);setDemoBalance(50000);lSave("demo_bal_"+uid,50000);setDemoPortfolio({balance:50000,pnl:0,pnlPct:0,totalTrades:0,wins:0,losses:0,winRate:0,bestTrade:0,worstTrade:0,profitFactor:0,totalWinAmount:0,totalLossAmount:0});lSave("demo_port_"+uid,{balance:50000,pnl:0,pnlPct:0,totalTrades:0,wins:0,losses:0,winRate:0,bestTrade:0,worstTrade:0,profitFactor:0,totalWinAmount:0,totalLossAmount:0});setAutoLog([]);(async()=>{try{await supabase.from("trades").delete().eq("user_id",uid).eq("is_demo",true);}catch(e){}})();}}} style={{flex:1,padding:"8px 0",borderRadius:4,border:"1px solid "+C.purple,background:C.purpleDim,color:C.purple,cursor:"pointer",fontFamily:"monospace",fontSize:10,fontWeight:700}}>RESET DEMO DATA</button>
+                  <button onClick={()=>{if(window.confirm("Clear all LIVE trade history? Cannot be undone.")){setLiveTradeHistory([]);lSave("live_history_"+uid,[]);setLiveBalance(0);lSave("live_bal_"+uid,0);setLivePortfolio({balance:0,pnl:0,pnlPct:0,totalTrades:0,wins:0,losses:0,winRate:0,bestTrade:0,worstTrade:0,profitFactor:0,totalWinAmount:0,totalLossAmount:0});lSave("live_port_"+uid,{balance:0,pnl:0,pnlPct:0,totalTrades:0,wins:0,losses:0,winRate:0,bestTrade:0,worstTrade:0,profitFactor:0,totalWinAmount:0,totalLossAmount:0});(async()=>{try{await supabase.from("trades").delete().eq("user_id",uid).eq("is_demo",false);}catch(e){}})();}}} style={{flex:1,padding:"8px 0",borderRadius:4,border:"1px solid "+C.red,background:C.redDim,color:C.red,cursor:"pointer",fontFamily:"monospace",fontSize:10,fontWeight:700}}>RESET LIVE DATA</button>
                 </div>
                 <div style={{background:C.goldDim,border:"1px solid "+C.gold+"44",borderRadius:4,padding:"8px 10px"}}>
                   <div style={{color:C.gold,fontSize:9}}>⚠ Resetting demo data gives you a fresh $50,000 demo balance. Resetting live data clears all live trade history.</div>
@@ -3959,9 +4203,16 @@ function TradingApp({user,onSignOut}){
                 }} style={{width:"100%",padding:"8px 0",borderRadius:5,border:"1px solid "+C.gold,background:C.goldDim,color:C.gold,cursor:"pointer",fontFamily:"monospace",fontSize:10,fontWeight:700,marginBottom:12}}>+ ADD COMPOUND ALERT</button>
               </>}
               <div style={{background:C.bg2,borderRadius:6,padding:10,marginBottom:12,border:"1px solid "+C.border}}>
-                <div style={{color:C.cyan,fontSize:9,fontWeight:700,marginBottom:6}}>WEBHOOK NOTIFICATIONS (Telegram/Discord)</div>
+                <div style={{color:C.cyan,fontSize:9,fontWeight:700,marginBottom:6}}>DISCORD WEBHOOK</div>
                 <input value={webhookUrl} onChange={e=>setWebhookUrl(e.target.value)} placeholder="Paste Discord webhook URL..." style={{width:"100%",background:C.bg3,border:"1px solid "+(webhookUrl?C.green:C.border),borderRadius:4,color:C.white,padding:"6px 8px",fontFamily:"monospace",fontSize:10,outline:"none",boxSizing:"border-box",marginBottom:6}}/>
-                <div style={{color:C.dimText,fontSize:8,lineHeight:1.6}}>Paste a Discord webhook URL (Server Settings → Integrations → Webhooks) to get alerts pushed outside the app. For Telegram, use a service like IFTTT or a Telegram bot webhook bridge — plain Telegram doesn't accept direct webhook POSTs.</div>
+                <div style={{color:C.dimText,fontSize:8,lineHeight:1.6}}>Server Settings → Integrations → Webhooks → paste URL here.</div>
+              </div>
+              <div style={{background:C.bg2,borderRadius:6,padding:10,marginBottom:12,border:"1px solid "+C.border}}>
+                <div style={{color:C.cyan,fontSize:9,fontWeight:700,marginBottom:6}}>TELEGRAM BOT ALERTS</div>
+                <input value={telegramBotToken} onChange={e=>setTelegramBotToken(e.target.value)} placeholder="Bot token from @BotFather..." style={{width:"100%",background:C.bg3,border:"1px solid "+(telegramBotToken?C.green:C.border),borderRadius:4,color:C.white,padding:"6px 8px",fontFamily:"monospace",fontSize:10,outline:"none",boxSizing:"border-box",marginBottom:6}}/>
+                <input value={telegramChatId} onChange={e=>setTelegramChatId(e.target.value)} placeholder="Your chat ID..." style={{width:"100%",background:C.bg3,border:"1px solid "+(telegramChatId?C.green:C.border),borderRadius:4,color:C.white,padding:"6px 8px",fontFamily:"monospace",fontSize:10,outline:"none",boxSizing:"border-box",marginBottom:6}}/>
+                <div style={{color:C.dimText,fontSize:8,lineHeight:1.6}}>1. Message @BotFather on Telegram, send /newbot, copy the token. 2. Message @userinfobot to get your chat ID. 3. Message your new bot once (any text) so it's allowed to reply to you.</div>
+                <button onClick={()=>sendWebhookAlert({pair:"TEST",type:"price_above",value:"test"})} style={{width:"100%",padding:"6px 0",borderRadius:4,border:"1px solid "+C.cyan,background:C.cyanDim,color:C.cyan,cursor:"pointer",fontSize:9,fontFamily:"monospace",marginTop:6}}>SEND TEST ALERT</button>
               </div>
               <div style={{maxHeight:200,overflowY:"auto"}}>
                 {alerts.map((a,i)=>{
@@ -3992,8 +4243,8 @@ function TradingApp({user,onSignOut}){
               {title:"◈ GETTING STARTED",color:C.cyan,items:[
                 {h:"1. Create Account",b:"Sign up with email and password. Set a 4-6 digit PIN for quick daily access. PIN is always required — Samsung Pass cannot bypass it."},
                 {h:"2. Choose Mode",b:"Toggle DEMO or LIVE using the switch top right or in Portfolio. Demo uses real Binance prices with $50,000 fake money. Always test in Demo first before going live."},
-                {h:"3. Set Strategy",b:"Go to Strategy tab. Click a preset (NEXUS Prime, Aggressive, TEST, Small Account or Custom) or adjust settings manually. Click SAVE STRATEGY. Settings persist permanently."},
-                {h:"4. Enable Auto Trading",b:"Set Auto Mode to FULL-AUTO in Strategy tab. Save. Make sure Demo Mode is ON. Watch the Auto Trade Log on the Markets page — trades fire within 30 seconds in TEST mode."},
+                {h:"3. Set Strategy",b:"Go to Strategy tab. Click a preset (NEXUS Apex, NEXUS Prime, Trend Rider, Aggressive, Small Account or Custom) or adjust settings manually. Click SAVE STRATEGY. Settings persist permanently — you'll see a clear ✓ STRATEGY SAVED confirmation."},
+                {h:"4. Enable Auto Trading",b:"Set Auto Mode to FULL-AUTO in Strategy tab. Save. Make sure Demo Mode is ON. Watch the Auto Trade Log on the Markets page for trades firing as signals qualify."},
                 {h:"5. Server Bot",b:"Go to Settings → Server Bot. Enable the toggle. The server runs 24/7 even when the app is closed. Requires Binance API key with trade permissions whitelisted to IP: 3.39.214.69."},
                 {h:"6. Going Live",b:"Run demo profitably for 2+ weeks. Go to Settings → RESET LIVE DATA for a clean start. Enter your exchange balance on the Portfolio page. Create a Binance trading API key whitelisted to 3.39.214.69."},
               ]},
@@ -4004,7 +4255,7 @@ function TradingApp({user,onSignOut}){
                 {h:"Signal Levels",b:"Right panel shows entry, stop loss and three take profit levels calculated from ATR. R:R ratio shown below."},
               ]},
               {title:"◈ AUTO TRADING",color:C.purple,items:[
-                {h:"TEST Mode",b:"Select TEST preset in Strategy. Sets min strength to 20%, disables all filters, 30 second cooldown. Trades fire within seconds. Do NOT use with real money."},
+                {h:"NEXUS Apex",b:"The strictest preset — min 80% strength, 1:3 R:R, every filter ON, multi-timeframe agreement required. Expect very few trades. Best used after running Walk-Forward + Monte Carlo and applying the results."},
                 {h:"FULL-AUTO",b:"Bot monitors all pairs every 3 seconds. Automatically opens trades, moves SL to breakeven at TP1, closes at TP2, applies trailing stops."},
                 {h:"SEMI-AUTO",b:"Monitors open positions only — applies trailing stops and breakeven. Does not open new trades automatically."},
                 {h:"Filters",b:"Session filter restricts to London/NY/Sydney/Asia hours. Correlation filter prevents trading correlated pairs simultaneously. Regime filter trades with the market trend only."},
@@ -4037,12 +4288,13 @@ function TradingApp({user,onSignOut}){
                 {h:"Multi-User",b:"Each user enters their own exchange API key. The server trades each account independently. 200 Binance users all work fine — each API key only accesses its own account."},
               ]},
               {title:"◈ STRATEGY BUILDER",color:C.gold,items:[
-                {h:"NEXUS Prime",b:"High probability conservative strategy. Min 72% signal strength. All filters ON. 1.5% risk. 2-3 quality trades per day. Best for accounts over $1000."},
-                {h:"NEXUS Trend Rider",b:"Trend following with trailing stop. 65% strength, regime filter ON. Closes 30% at TP1 (stop moves to breakeven), 30% at TP2, 40% trails 2x ATR indefinitely. Best strategy for letting winners run — a trade that goes 5x or 10x stays open the whole way."},
+                {h:"NEXUS Apex",b:"The most selective strategy in the app. Min 80% signal strength, 1:3 R:R minimum, every filter ON, requires multi-timeframe agreement. Uses Kelly Criterion sizing capped at 3%. Most days it finds zero trades — that's by design. Run Walk-Forward + Monte Carlo (Backtest tab) and apply the results before trusting it — no strategy is guaranteed to win, this one is just held to the highest bar the app can enforce."},
+                {h:"NEXUS Prime",b:"High probability conservative strategy. Min 72% signal strength. All filters ON. Uses Kelly Criterion sizing capped at 2% once you have 10+ trades (falls back to flat 1.5% before that). 2-3 quality trades per day. Best for accounts over $1000."},
+                {h:"NEXUS Trend Rider",b:"Trend following with trailing stop. 65% strength, regime + multi-timeframe + correlation filters ON. Closes 30% at TP1 (stop moves to breakeven), 30% at TP2, 40% trails 2x ATR indefinitely. Session and volatility filters stay off deliberately since real trends don't wait for a specific session. Best strategy for letting winners run — a trade that goes 5x or 10x stays open the whole way."},
                 {h:"Aggressive",b:"Higher frequency at 60% strength. More trades, lower average quality. No filters. Suitable for experienced traders in trending markets."},
                 {h:"Small Account $100",b:"Optimised for under $500. 75% strength, 3:1 minimum R:R. Only 2 trades per day. Trailing stop ON. Compound all profits slowly."},
-                {h:"TEST Mode",b:"Fires on almost any signal for testing only. Never use with real money. Auto trades within 30 seconds."},
                 {h:"Custom Strategy",b:"Adjust all settings, write your description, save with your own name. Settings saved permanently to Supabase — same on all devices."},
+                {h:"Walk-Forward & Monte Carlo",b:"In Backtest tab, run a normal backtest first, then Walk-Forward (splits history into 4 periods, checks consistency) and Monte Carlo (reshuffles your actual trades 1,000 times to reveal realistic best/worst case outcomes). Click APPLY TO AUTO-TRADING to save the scores — auto-trading will then automatically reduce position size or pause entirely if the strategy's consistency is low or ruin risk is high."},
                 {h:"Trailing Stop",b:"In Strategy tab toggle Trailing Stop ON. Choose ATR (adjusts to volatility) or Percentage. Set Trail ATR Mult (2 = trails 2x ATR below peak). Set TP1/TP2/Remain % split — Remain portion stays open following price indefinitely until reversal."},
                 {h:"Breakeven",b:"Toggle Breakeven at TP1 ON in Strategy tab. When TP1 is hit the stop loss automatically moves to your entry price — the trade becomes risk-free. The → BE button on open positions does this manually anytime."},
                 {h:"Indicator Settings",b:"Chart → IND SETTINGS tab. Toggle Custom ON to set your own RSI, MACD, EMA, BB, ATR, ADX, Supertrend and other periods. Toggle OFF to use AI-optimised defaults. Auto trades always use AI defaults regardless."},
@@ -4119,7 +4371,7 @@ function TradingApp({user,onSignOut}){
         </div>
       )}
 
-      {showOrderModal&&<OrderModal pair={selectedPair} signal={sig} price={price} isDemo={isDemo} balance={currentBalance} onClose={()=>setShowOrderModal(false)} onPlace={placeOrder}/>}
+      {showOrderModal&&<OrderModal pair={selectedPair} signal={sig} price={price} isDemo={isDemo} balance={currentBalance} strategy={strategy} onClose={()=>setShowOrderModal(false)} onPlace={placeOrder}/>}
       {showAddPair&&<AddPairModal activePairs={activePairs} onAdd={addPair} onClose={()=>setShowAddPair(false)}/>}
       {showExchangeModal&&<ExchangeManagerModal onClose={()=>setShowExchangeModal(false)} exchanges={exchangeKeys} onSave={keys=>{setExchangeKeys(keys);lSave("exchkeys_"+uid,keys);}}/>}
     </div>
